@@ -1,0 +1,320 @@
+"""
+Manufacturing Optimization Pipeline
+-----------------------------------
+This is a self-contained prototype illustrating an end-to-end pipeline that integrates:
+- NLP (mocked) to extract parameter ranges from documents
+- ML (RandomForest) trained on synthetic/historical data to predict yield
+- Monte Carlo simulation to evaluate uncertainty
+- Global optimization (random search + local refinement) to find best parameters
+- Linear Programming (simple LP using scipy if available, otherwise discretized search)
+
+How to use:
+- Run the script (Python 3.8+) in an environment with: numpy, pandas, scikit-learn, optionally scipy
+- The script creates synthetic data, trains a model, runs Monte Carlo, optimizes, and solves a simple LPP
+
+This is intended as a blueprint: replace the synthetic data and mocked-NLP with real inputs.
+"""
+
+import random
+import math
+import json
+from typing import Dict, Tuple, List
+
+import numpy as np
+import pandas as pd
+
+# Try imports with graceful fallback
+try:
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import mean_squared_error
+    SKLEARN_AVAILABLE = True
+except Exception as e:
+    SKLEARN_AVAILABLE = False
+
+try:
+    from scipy.optimize import linprog
+    SCIPY_AVAILABLE = True
+except Exception:
+    SCIPY_AVAILABLE = False
+
+# -----------------------------
+# 1) Mocked NLP: extract parameter ranges
+# -----------------------------
+
+def mocked_nlp_extract() -> Dict[str, Tuple[float, float]]:
+    """Pretend we've parsed literature and extracted reasonable parameter ranges.
+    Replace this with real NLP extraction (e.g., spaCy/transformers) in production.
+    Returns dict: parameter -> (low, high)
+    """
+    # Example parameters for a crystallization step
+    param_ranges = {
+        "temperature_c": (70.0, 80.0),   # degrees Celsius
+        "reaction_time_h": (4.0, 6.0),   # hours
+        "catalyst_ratio": (0.8, 1.2),    # ratio
+    }
+    return param_ranges
+
+# -----------------------------
+# 2) Generate synthetic historical data (replace with real dataset)
+# -----------------------------
+
+def generate_synthetic_data(n_samples: int = 200, seed: int = 42) -> pd.DataFrame:
+    np.random.seed(seed)
+    temps = np.random.uniform(70, 80, size=n_samples)
+    times = np.random.uniform(4, 6, size=n_samples)
+    catalysts = np.random.uniform(0.8, 1.2, size=n_samples)
+
+    # Construct a non-linear yield function with noise
+    yields = (
+        0.6 +
+        0.25 * np.exp(-((temps - 73.0) ** 2) / (2 * 1.5 ** 2)) +
+        0.1 * np.exp(-((times - 5.0) ** 2) / (2 * 0.5 ** 2)) +
+        0.12 * np.exp(-((catalysts - 1.05) ** 2) / (2 * 0.08 ** 2))
+    )
+    # yields roughly between 0 and 1 (fractional yield)
+    yields = yields + np.random.normal(0, 0.02, size=n_samples)  # measurement noise
+    yields = np.clip(yields, 0.0, 1.0)
+
+    df = pd.DataFrame({
+        "temperature_c": temps,
+        "reaction_time_h": times,
+        "catalyst_ratio": catalysts,
+        "yield": yields,
+    })
+    return df
+
+# -----------------------------
+# 3) Train ML model (RandomForest) to predict yield
+# -----------------------------
+
+def train_model(df: pd.DataFrame):
+    if not SKLEARN_AVAILABLE:
+        raise ImportError("scikit-learn is required for training the model. Install scikit-learn.")
+
+    X = df[["temperature_c", "reaction_time_h", "catalyst_ratio"]]
+    y = df["yield"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    model = RandomForestRegressor(n_estimators=200, random_state=42)
+    model.fit(X_train, y_train)
+
+    preds = model.predict(X_test)
+    rmse = mean_squared_error(y_test, preds, squared=False)
+    print(f"Trained RandomForest -- RMSE on holdout: {rmse:.4f}")
+
+    return model
+
+# -----------------------------
+# 4) Monte Carlo simulation using the ML model as a surrogate
+# -----------------------------
+
+def monte_carlo_simulation(
+    model,
+    param_ranges: Dict[str, Tuple[float, float]],
+    n_sim: int = 10000,
+    random_seed: int = 123,
+) -> pd.DataFrame:
+    """Sample parameter space, predict yields using the model, and compute summary stats."""
+    np.random.seed(random_seed)
+    samples = []
+    for _ in range(n_sim):
+        t = np.random.uniform(*param_ranges["temperature_c"])  # temperature
+        rt = np.random.uniform(*param_ranges["reaction_time_h"])  # reaction time
+        c = np.random.uniform(*param_ranges["catalyst_ratio"])  # catalyst
+        x = np.array([[t, rt, c]])
+        y_pred = model.predict(x)[0]
+        # Add small aleatoric noise to mimic measurement/production noise
+        y_noisy = y_pred + np.random.normal(0, 0.01)
+        samples.append((t, rt, c, max(0.0, min(1.0, y_noisy))))
+
+    mc_df = pd.DataFrame(samples, columns=["temperature_c", "reaction_time_h", "catalyst_ratio", "yield"])
+
+    # Compute best ranges by looking at top-percentile
+    top_pct = mc_df[mc_df["yield"] >= mc_df["yield"].quantile(0.90)]
+    summary = {
+        "yield_mean": mc_df["yield"].mean(),
+        "yield_std": mc_df["yield"].std(),
+        "yield_90pct": mc_df["yield"].quantile(0.90),
+        "top_ranges": {
+            "temperature_c": (top_pct["temperature_c"].min(), top_pct["temperature_c"].max()),
+            "reaction_time_h": (top_pct["reaction_time_h"].min(), top_pct["reaction_time_h"].max()),
+            "catalyst_ratio": (top_pct["catalyst_ratio"].min(), top_pct["catalyst_ratio"].max()),
+        },
+    }
+    print("Monte Carlo summary:", json.dumps({k: (v if not isinstance(v, dict) else None) for k, v in summary.items()}, default=str))
+    return mc_df, summary
+
+# -----------------------------
+# 5) Optimization of parameters (maximize expected yield while penalizing resource cost)
+# -----------------------------
+
+def objective_function(x: List[float], model, cost_weights: Dict[str, float]) -> float:
+    """Objective to maximize: expected yield - cost_penalty
+    x = [temperature, reaction_time, catalyst]
+    cost = cost_weights["temperature"] * (x[0] - 70.0) / 10.0 + \
+           cost_weights["time"] * (x[1] - 4.0) / 2.0 + \
+           cost_weights["catalyst"] * abs(x[2] - 1.0)
+    pred = model.predict(np.array([x]))[0]
+    # We return negative because many optimizers minimize
+    return -(pred - 0.01 * cost)
+
+
+def random_search_optimize(
+    model,
+    param_ranges: Dict[str, Tuple[float, float]],
+    cost_weights: Dict[str, float],
+    n_iter: int = 2000,
+    random_seed: int = 0,
+) -> Dict:
+    np.random.seed(random_seed)
+    best = None
+    best_val = float("inf")  # since objective returns negative of utility to minimize
+    for i in range(n_iter):
+        t = np.random.uniform(*param_ranges["temperature_c"])  # temperature
+        rt = np.random.uniform(*param_ranges["reaction_time_h"])  # reaction time
+        c = np.random.uniform(*param_ranges["catalyst_ratio"])  # catalyst
+        val = objective_function([t, rt, c], model, cost_weights)
+        if val < best_val:
+            best_val = val
+            best = {"temperature_c": t, "reaction_time_h": rt, "catalyst_ratio": c, "obj": val}
+    print(f"Random-search best objective: {best_val:.6f}")
+    return best
+
+
+def local_refinement(best_candidate: Dict, model, param_ranges, cost_weights, n_steps: int = 200) -> Dict:
+    # Simple hill-climb: small gaussian perturbations, accept if improvement
+    current = best_candidate.copy()
+    current_val = objective_function([current["temperature_c"], current["reaction_time_h"], current["catalyst_ratio"]], model, cost_weights)
+    for i in range(n_steps):
+        t = current["temperature_c"] + np.random.normal(0, 0.2)
+        rt = current["reaction_time_h"] + np.random.normal(0, 0.05)
+        c = current["catalyst_ratio"] + np.random.normal(0, 0.01)
+        # clip to ranges
+        t = float(np.clip(t, *param_ranges["temperature_c"]))
+        rt = float(np.clip(rt, *param_ranges["reaction_time_h"]))
+        c = float(np.clip(c, *param_ranges["catalyst_ratio"]))
+        val = objective_function([t, rt, c], model, cost_weights)
+        if val < current_val:
+            current = {"temperature_c": t, "reaction_time_h": rt, "catalyst_ratio": c, "obj": val}
+            current_val = val
+    print(f"Local refinement best objective: {current_val:.6f}")
+    return current
+
+# -----------------------------
+# 6) Simple Linear Programming example: allocate batch production under resource constraints
+# -----------------------------
+
+def solve_simple_lpp(best_params: Dict, resource_limits: Dict[str, float]):
+    """
+    Example: We have two products (A & B). Each consumes raw_material and machine_hours per batch.
+    Profit per batch (assume proportional to predicted yield * base_price). We maximize profit.
+    This demonstrates LPP on top of chosen manufacturing parameters.
+    """
+    # For illustration we create a little problem where profit per unit for Product A and B
+    # depends on the predicted yield at the optimized parameters.
+
+    # Mock product coefficients (these would be domain-specific)
+    # consumption per batch
+    raw_per_batch = np.array([2.0, 1.5])
+    hours_per_batch = np.array([3.0, 2.0])
+
+    # predicted yield from model is used to estimate profit per batch
+    # assume base prices
+    base_price = np.array([100.0, 80.0])
+    predicted_yield = 0.0
+    if best_params is not None:
+        # use the optimized parameter point to get predicted yield
+        try:
+            predicted_yield = float(model.predict(np.array([[best_params['temperature_c'], best_params['reaction_time_h'], best_params['catalyst_ratio']]]))[0])
+        except Exception:
+            predicted_yield = 0.75
+    profit_per_batch = base_price * predicted_yield
+
+    # Objective: maximize profit_per_batch * x  subject to constraints
+    # Convert to minimization by negating
+    c = -profit_per_batch
+
+    A = np.vstack([raw_per_batch, hours_per_batch])
+    b = np.array([resource_limits.get('raw_material', 500.0), resource_limits.get('machine_hours', 400.0)])
+
+    if SCIPY_AVAILABLE:
+        # scipy.optimize.linprog solves minimization c^T x subject to A_ub x <= b
+        res = linprog(c, A_ub=A, b_ub=b, bounds=[(0, None), (0, None)])
+        if res.success:
+            x_opt = res.x
+            max_profit = -res.fun
+            return {"x": x_opt, "profit": max_profit, "success": True}
+        else:
+            return {"success": False, "message": res.message}
+    else:
+        # fallback: grid search discretized (coarse)
+        max_profit = -1e9
+        best_x = None
+        # coarse grid up to 1000 batches each (but constrained by resources) -> keep small
+        max_batches = int(min(b[0] // min(raw_per_batch), b[1] // min(hours_per_batch), 500))
+        for a in range(0, max_batches + 1):
+            # solve for b from constraints
+            remaining_raw = b[0] - raw_per_batch[0] * a
+            remaining_hours = b[1] - hours_per_batch[0] * a
+            if remaining_raw < 0 or remaining_hours < 0:
+                break
+            # b max allowed
+            b_max_raw = remaining_raw // raw_per_batch[1]
+            b_max_hours = remaining_hours // hours_per_batch[1]
+            b_max = int(min(b_max_raw, b_max_hours))
+            # profit
+            profit = profit_per_batch[0] * a + profit_per_batch[1] * b_max
+            if profit > max_profit:
+                max_profit = profit
+                best_x = (a, int(b_max))
+        return {"x": best_x, "profit": max_profit, "success": True}
+
+# -----------------------------
+# Entrypoint: chain everything
+# -----------------------------
+if __name__ == '__main__':
+    print("--- Manufacturing Optimization Prototype ---")
+
+    # NLP extraction
+    param_ranges = mocked_nlp_extract()
+    print("Parameter ranges (from mocked-NLP):", param_ranges)
+
+    # Data generation + model training
+    df = generate_synthetic_data(n_samples=400)
+    print("Synthetic data sample:\n", df.head().to_dict(orient='records')[:2])
+
+    if not SKLEARN_AVAILABLE:
+        print("scikit-learn not available. Install it to train the ML model. Exiting.")
+        raise SystemExit(1)
+
+    model = train_model(df)
+
+    # Monte Carlo
+    mc_df, mc_summary = monte_carlo_simulation(model, param_ranges, n_sim=5000)
+    print("Monte Carlo 90th pct yield:", mc_summary["yield_90pct"])
+    print("Top parameter ranges (90th pct):", mc_summary["top_ranges"]) 
+
+    # Optimization
+    cost_weights = {"temperature": 1.0, "time": 1.0, "catalyst": 0.5}
+    best_rand = random_search_optimize(model, param_ranges, cost_weights, n_iter=3000)
+    best_refined = local_refinement(best_rand, model, param_ranges, cost_weights, n_steps=500)
+
+    print("Optimized parameters (after refinement):", best_refined)
+    predicted_best_yield = model.predict(np.array([[best_refined['temperature_c'], best_refined['reaction_time_h'], best_refined['catalyst_ratio']]]))[0]
+    print(f"Predicted yield at optimized point: {predicted_best_yield:.4f}")
+
+    # LPP: resource allocation using the optimized parameters
+    resource_limits = {"raw_material": 500.0, "machine_hours": 400.0}
+    lpp_res = solve_simple_lpp(best_refined, resource_limits)
+    print("LPP result:", lpp_res)
+
+    # Short summary JSON to export
+    final_report = {
+        "param_ranges": param_ranges,
+        "mc_summary": mc_summary,
+        "optimized_params": best_refined,
+        "predicted_yield": float(predicted_best_yield),
+        "lpp": lpp_res,
+    }
+    print('\nFinal report snippet:\n', json.dumps(final_report, indent=2))
